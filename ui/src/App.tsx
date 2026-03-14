@@ -1,0 +1,135 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import { A2UIProvider, A2UIRenderer, useA2UI } from "@a2ui/react";
+import type { ServerToClientMessage } from "@a2ui/react";
+import "./App.css";
+import Chat from "./components/Chat";
+import { Badge } from "@/components/ui/badge";
+import { createSession, streamMessage } from "./lib/adkClient";
+import { parseAgentResponse } from "./lib/a2uiParser";
+import type { ChatMessage } from "./types";
+
+const USER_ID = "user-" + Math.random().toString(36).slice(2, 8);
+
+/**
+ * The @a2ui/react processor requires a `beginRendering` message to set the
+ * rootComponentId before it can build a componentTree from `surfaceUpdate`.
+ * Some LLM responses skip it and go straight to surfaceUpdate + dataModelUpdate.
+ * This function synthesises the missing beginRendering from the surfaceUpdate.
+ */
+function ensureBeginRendering(msgs: ServerToClientMessage[]): ServerToClientMessage[] {
+	const hasBeginRendering = msgs.some((m) => typeof m === "object" && m !== null && "beginRendering" in m);
+	if (hasBeginRendering) return msgs;
+
+	// Find the first surfaceUpdate to derive surfaceId and root component
+	const surfaceUpdateMsg = msgs.find((m) => typeof m === "object" && m !== null && "surfaceUpdate" in m) as
+		| Record<string, { surfaceId: string; components?: Array<{ id: string }> }>
+		| undefined;
+
+	if (!surfaceUpdateMsg?.surfaceUpdate) return msgs;
+
+	const { surfaceId, components } = surfaceUpdateMsg.surfaceUpdate;
+	const rootId = components?.[0]?.id ?? "root";
+
+	const synthetic: ServerToClientMessage = {
+		beginRendering: { surfaceId, root: rootId },
+	} as unknown as ServerToClientMessage;
+
+	// Prepend beginRendering so the processor sets rootComponentId first
+	return [synthetic, ...msgs];
+}
+
+// Inner component so useA2UI() can access the A2UIProvider context
+function AgentApp() {
+	const { processMessages } = useA2UI();
+	const [messages, setMessages] = useState<ChatMessage[]>([]);
+	const [isLoading, setIsLoading] = useState(false);
+	const [sessionId, setSessionId] = useState<string | null>(null);
+	const [hasSurface, setHasSurface] = useState(false);
+	const [surfaceId, setSurfaceId] = useState<string>("main");
+	const sessionInit = useRef(false);
+
+	useEffect(() => {
+		if (sessionInit.current) return;
+		sessionInit.current = true;
+		createSession(USER_ID)
+			.then(setSessionId)
+			.catch((err) => console.error("Session init failed:", err));
+	}, []);
+
+	const handleSend = useCallback(
+		async (text: string) => {
+			if (!sessionId) return;
+
+			const userMsg: ChatMessage = { id: Date.now().toString(), role: "user", text };
+			const agentMsgId = (Date.now() + 1).toString();
+			const agentMsg: ChatMessage = { id: agentMsgId, role: "agent", text: "", isStreaming: true };
+
+			setMessages((prev) => [...prev, userMsg, agentMsg]);
+			setIsLoading(true);
+
+			let accumulated = "";
+			try {
+				for await (const event of streamMessage(USER_ID, sessionId, text)) {
+					if (event.error_message) throw new Error(event.error_message);
+					// Accept model-role events OR is_final_response events (some ADK versions omit role)
+					const isModelEvent = event.content?.role === "model" || event.is_final_response;
+					if (!event.content?.parts || !isModelEvent) continue;
+
+					const textPart = event.content.parts.map((p) => p.text ?? "").join("");
+					if (!textPart) continue;
+
+					accumulated += textPart;
+					const partial = parseAgentResponse(accumulated).text;
+					setMessages((prev) => prev.map((m) => (m.id === agentMsgId ? { ...m, text: partial } : m)));
+				}
+
+				const parsed = parseAgentResponse(accumulated);
+				setMessages((prev) => prev.map((m) => (m.id === agentMsgId ? { ...m, text: parsed.text, isStreaming: false } : m)));
+
+				if (parsed.a2uiMessages) {
+					const msgs = ensureBeginRendering(parsed.a2uiMessages as ServerToClientMessage[]);
+					const beginMsg = msgs.find((m) => typeof m === "object" && m !== null && "beginRendering" in m) as Record<string, Record<string, string>> | undefined;
+					const id = beginMsg?.beginRendering?.surfaceId ?? "main";
+					setSurfaceId(id);
+					processMessages(msgs);
+					setHasSurface(true);
+				}
+			} catch (err) {
+				const msg = err instanceof Error ? err.message : String(err);
+				setMessages((prev) => prev.map((m) => (m.id === agentMsgId ? { ...m, text: `Error: ${msg}`, isStreaming: false } : m)));
+			} finally {
+				setIsLoading(false);
+			}
+		},
+		[sessionId, processMessages],
+	);
+
+	return (
+		<div className="app">
+			<header className="app-header">
+				<h1 className="text-lg font-semibold tracking-tight">Restaurant Finder</h1>
+				{!sessionId && <Badge variant="secondary">Connecting…</Badge>}
+			</header>
+			<main className="app-body">
+				<Chat messages={messages} onSend={handleSend} isLoading={isLoading || !sessionId} />
+				<section className="a2ui-panel">
+					{hasSurface ? (
+						<A2UIRenderer surfaceId={surfaceId} />
+					) : (
+						<div className="a2ui-empty">
+							<p>UI generated by the agent will appear here.</p>
+						</div>
+					)}
+				</section>
+			</main>
+		</div>
+	);
+}
+
+export default function App() {
+	return (
+		<A2UIProvider onAction={(msg) => console.log("A2UI action:", msg)}>
+			<AgentApp />
+		</A2UIProvider>
+	);
+}
